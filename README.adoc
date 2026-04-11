@@ -4,6 +4,7 @@ Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
 :toc:
 :source-highlighter: highlight.js
 
+image:https://zenodo.org/badge/DOI/10.5281/zenodo.19520245.svg[DOI,link=https://doi.org/10.5281/zenodo.19520245]
 image:https://img.shields.io/badge/license-PMPL--1.0--or--later-blue[License]
 
 == Overview
