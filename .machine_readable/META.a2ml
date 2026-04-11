@@ -1,0 +1,24 @@
+;; SPDX-License-Identifier: PMPL-1.0-or-later
+;; META.a2ml — snif meta
+
+(meta
+  (project "snif")
+  (full-name "SNIFs: Safe Native Implemented Functions for the BEAM via WebAssembly Sandboxing")
+  (license "PMPL-1.0-or-later")
+  (author "Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>")
+  (architecture-decisions
+    (decision
+      (id "ADR-001")
+      (title "ReleaseSafe is the only correct Zig mode for SNIFs")
+      (status "accepted")
+      (rationale "ReleaseFast removes bounds checks; UB collapses to silent wrong answers (empirically verified). ReleaseSafe emits unreachable instructions for all violations — these trap correctly. Debug is equivalent for isolation but adds avoidable overhead."))
+    (decision
+      (id "ADR-002")
+      (title "wasm32-freestanding over wasm32-wasi")
+      (status "accepted")
+      (rationale "Freestanding is sufficient for pure computation NIFs. WASI adds I/O capability at the cost of import binding complexity. Freestanding chosen for demo simplicity; WASI is future work."))
+    (decision
+      (id "ADR-003")
+      (title "Per-call wasmex instance")
+      (status "accepted")
+      (rationale "Each Loader.call/3 starts a fresh wasmex GenServer and stops it after the call. This gives per-call memory isolation. Performance not the priority for this paper; persistent instances are future work."))))

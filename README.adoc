@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: PMPL-1.0-or-later
+= SNIFs: Safe Native Implemented Functions for the BEAM via WebAssembly Sandboxing
+Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+:toc:
+:source-highlighter: highlight.js
+
+image:https://img.shields.io/badge/license-PMPL--1.0--or--later-blue[License]
+
+== Overview
+
+SNIFs (Safe NIFs) demonstrates that WebAssembly sandboxing provides genuine
+crash isolation for BEAM NIFs. Any crash in a NIF normally kills the entire
+BEAM VM. This project shows that compiling native code (Zig) to WebAssembly
+and loading it through `wasmex` converts all guest faults into
+`{:error, reason}` tuples — the BEAM process survives unconditionally.
+
+== Key result
+
+11/11 integration tests pass on OTP 28 / Elixir 1.19.5. Every failure mode
+(OOB array access, `unreachable`, `@panic`, integer overflow, divide-by-zero)
+traps correctly under `ReleaseSafe` compilation. The BEAM survives all of them.
+
+== Critical invariant
+
+*Always compile Zig WASM with `-OReleaseSafe`.* `ReleaseFast` removes bounds
+checks and converts undefined behaviour into silent wrong answers (empirically
+verified — see paper).
+
+== Repository layout
+
+----
+zig/src/safe_nif.zig     Zig source with six crash modes + fibonacci
+priv/*.wasm              Pre-built WASM binaries (ReleaseSafe + ReleaseFast)
+demo/                    Mix project with wasmex loader + ExUnit test suite
+docs/whitepapers/        LaTeX paper + compiled PDF
+----
+
+== Running the demo
+
+[source,shell]
+----
+cd demo
+mix deps.get
+mix test
+----
+
+Requires Elixir 1.15+, OTP 26+ (precompiled wasmex NIF downloaded automatically).
+
+== Rebuilding the WASM
+
+[source,shell]
+----
+just build-wasm
+----
+
+Requires Zig 0.15+.
+
+== Paper
+
+`docs/whitepapers/academic/snif.pdf` — also available on Zenodo (DOI pending).
+
+== License
+
+PMPL-1.0-or-later. See `LICENSE`.

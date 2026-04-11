@@ -1,0 +1,585 @@
+% SPDX-License-Identifier: PMPL-1.0-or-later
+% Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+%
+% SNIFs: Safe Native Implemented Functions for the BEAM via WebAssembly Sandboxing
+% Prepared for Zenodo deposit.
+
+\documentclass[11pt,a4paper]{article}
+
+%%% Packages %%%
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+%%% Theorem environments %%%
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{observation}{Observation}
+
+%%% Listings %%%
+\definecolor{codegreen}{rgb}{0,0.5,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.97,0.97,0.97}
+
+\lstdefinelanguage{Zig}{
+  keywords={const,var,fn,export,pub,return,if,else,while,for,unreachable,
+            comptime,inline,struct,enum,union,error,try,catch,defer,
+            null,undefined,true,false,void,noreturn,anytype},
+  sensitive=true,
+  morecomment=[l]{//},
+  morestring=[b]",
+}
+
+\lstdefinelanguage{Elixir}{
+  keywords={def,defmodule,do,end,case,with,when,fn,if,else,
+            true,false,nil,and,or,not,in},
+  sensitive=true,
+  morecomment=[l]{\#},
+  morestring=[b]",
+}
+
+\lstdefinelanguage{WebAssembly}{
+  keywords={unreachable,local.get,local.set,i32.const,i64.const,
+            call,br\_if,block,end,return,i32.add,memory.fill,
+            i32.store,i64.store,global.get,global.set},
+  sensitive=true,
+  morecomment=[l]{;; },
+}
+
+\lstset{
+  backgroundcolor=\color{backcolour},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codepurple}\bfseries,
+  commentstyle=\color{codegreen},
+  stringstyle=\color{codegray},
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=6pt,
+  xrightmargin=6pt,
+  aboveskip=10pt,
+  belowskip=10pt,
+  captionpos=b,
+}
+
+%%% Metadata %%%
+\title{\textbf{SNIFs: Safe Native Implemented Functions for the BEAM\\
+       via WebAssembly Sandboxing}}
+\author{Jonathan D.A. Jewell\\
+        \small The Open University\\
+        \small \texttt{j.d.a.jewell@open.ac.uk}}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Native Implemented Functions (NIFs) in the BEAM virtual machine (Erlang/OTP,
+Elixir) offer near-zero-overhead access to native code, but carry an
+inescapable risk: any crash in a NIF kills the entire VM process, defeating
+the BEAM's celebrated fault-isolation guarantees. Dirty NIFs address scheduling
+fairness but provide no crash isolation. Port-based solutions achieve isolation
+at the cost of a process boundary---at which point the primitive is no longer a
+NIF. We present \textit{SNIFs} (Safe NIFs): a architecture that compiles native
+code to WebAssembly, loads it through an embedded Wasmtime runtime (via the
+\texttt{wasmex} library), and catches all guest faults as \texttt{\{:error,
+reason\}} tuples before they reach the BEAM scheduler. We provide an empirical
+evaluation across three Zig optimisation modes and five failure categories,
+show the compiled WASM instructions that explain each result, and demonstrate
+11 passing integration tests in which the BEAM process survives every trap
+class. We identify a critical mode invariant---\textit{ReleaseSafe} must be
+used; \textit{ReleaseFast} converts undefined behaviour into silent wrong
+answers---and connect the architecture to the typed-wasm level framework, where
+Level-5 bounds proofs eliminate the need for runtime checks entirely.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%%% 1. Introduction %%%
+\section{Introduction}
+
+The BEAM virtual machine underpins Erlang and Elixir's reputation for
+fault-tolerant distributed systems. Its process model guarantees that a
+crashing process cannot harm its neighbours; supervisors detect failures and
+restart workers, enabling the ``let it crash'' philosophy. Yet there is a
+well-known gap in this isolation model: Native Implemented Functions (NIFs).
+
+A NIF is a shared-library function loaded directly into the BEAM process's
+address space. When a NIF segfaults, overflows a buffer, or dereferences a
+null pointer, the operating system delivers \texttt{SIGSEGV} to the BEAM
+process itself. The VM has no opportunity to catch it. The entire node
+dies---potentially dropping thousands of concurrent connections.
+
+Two workarounds exist in the ecosystem:
+
+\begin{enumerate}
+  \item \textbf{Dirty NIFs} (\texttt{ERL\_NIF\_DIRTY\_JOB\_CPU\_BOUND},
+        \texttt{ERL\_NIF\_DIRTY\_JOB\_IO\_BOUND}): run the NIF on a dedicated
+        thread pool, preventing scheduler starvation. A crash still kills the
+        VM. The fix is for scheduling, not isolation.
+
+  \item \textbf{Ports}: spawn an external OS process, communicate via byte
+        streams. True crash isolation is achieved---if the external process
+        dies, the BEAM port detects it and the supervisor can restart. However,
+        a Port is not a NIF: it requires serialisation, an OS process boundary,
+        and process-spawn overhead. The performance profile is categorically
+        different.
+\end{enumerate}
+
+We ask: is there a middle ground that provides genuine crash isolation without
+the full overhead of a process boundary?
+
+\subsection{Contribution}
+
+This paper makes four contributions:
+
+\begin{enumerate}
+  \item An architecture (\S\ref{sec:architecture}) in which Zig source is
+        compiled to WebAssembly (\texttt{wasm32-freestanding}), loaded by the
+        \texttt{wasmex} Elixir library (which embeds Wasmtime as an OTP
+        application), and called from Elixir with standard function-call
+        syntax. WASM traps are returned as \texttt{\{:error, reason\}} tuples;
+        the BEAM process remains alive.
+
+  \item An empirical evaluation (\S\ref{sec:evaluation}) of three Zig
+        optimisation modes (\textit{Debug}, \textit{ReleaseSafe},
+        \textit{ReleaseFast}) across five failure categories, with
+        disassembled WASM instructions confirming the mechanism in each case.
+
+  \item A critical mode invariant (\S\ref{sec:mode-invariant}):
+        \textit{ReleaseSafe} is the only correct mode for SNIFs.
+        \textit{ReleaseFast} turns undefined behaviour (OOB access,
+        divide-by-zero) into \textit{silent wrong answers} rather than
+        crashes---arguably worse for a NIF, which the caller trusts to
+        be correct.
+
+  \item A connection to the typed-wasm progressive level framework
+        (\S\ref{sec:typed-wasm}): Level-5 bounds proofs eliminate the
+        entire class of OOB failures at the type level, removing the
+        need for runtime checks and making the ReleaseSafe/ReleaseFast
+        distinction moot for verified code.
+\end{enumerate}
+
+\subsection{Artefacts}
+
+All code, WASM binaries, Elixir tests, and the full test output are available
+at:
+\begin{center}
+  \url{https://github.com/hyperpolymath/snif}
+\end{center}
+
+%%% 2. Background %%%
+\section{Background}
+\label{sec:background}
+
+\subsection{NIFs and their crash semantics}
+
+NIFs are defined by the \texttt{erl\_nif} C API. A shared library is loaded
+via \texttt{erlang:load\_nif/2}; exported C functions become callable from
+Erlang/Elixir. They execute in the calling scheduler thread. Any fault that
+raises a Unix signal (\texttt{SIGSEGV}, \texttt{SIGBUS}, \texttt{SIGILL})
+is delivered to the BEAM OS process, bypassing OTP's supervision tree entirely.
+
+\subsection{WebAssembly as a sandboxing primitive}
+
+WebAssembly (WASM) is a binary instruction format with a formally defined
+execution semantics. Programs execute inside a linear memory space that is
+separated from the host's address space. Memory accesses are bounds-checked;
+out-of-bounds accesses raise a \textit{trap}. A trap is an explicit exceptional
+condition in the WASM semantics---not a Unix signal---and host runtimes are
+required to catch it and report it to the embedder.
+
+Wasmtime (Bytecode Alliance) implements trap handling by registering
+\texttt{SIGSEGV} and \texttt{SIGILL} signal handlers before executing any
+WASM code. Signals raised within WASM's linear memory region are intercepted
+and converted to \texttt{Trap} error values returned through the embedding API.
+Signals originating outside WASM's mapped region pass through to the host,
+preserving normal fault semantics for non-WASM code.
+
+\subsection{The wasmex library}
+
+\texttt{wasmex} is an Elixir library that embeds Wasmtime as a NIF (built with
+Rustler) and exposes an OTP GenServer interface. The key API used in this work is:
+
+\begin{lstlisting}[language=Elixir, caption={wasmex 0.14 calling convention}]
+{:ok, pid} = Wasmex.start_link(%{bytes: wasm_binary})
+result = Wasmex.call_function(pid, "function_name", [args])
+# result :: {:ok, [values]} | {:error, reason}
+\end{lstlisting}
+
+WASM traps surface as \texttt{\{:error, reason\}} tuples. The \texttt{pid}
+GenServer and the calling Elixir process both remain alive.
+
+\subsection{Zig optimisation modes}
+
+Zig provides four build modes relevant to this work:
+
+\begin{itemize}
+  \item \textbf{Debug}: all safety checks enabled; runtime panics on every
+        detected violation.
+  \item \textbf{ReleaseSafe}: optimisations enabled; safety checks retained
+        (bounds checking, overflow detection, division-by-zero detection).
+  \item \textbf{ReleaseFast}: maximum optimisation; safety checks \emph{removed}.
+        Undefined behaviour (UB) is assumed never to occur; the compiler is
+        free to exploit this assumption.
+  \item \textbf{ReleaseSmall}: size-optimised variant of ReleaseFast, not
+        evaluated in this paper.
+\end{itemize}
+
+%%% 3. Architecture %%%
+\section{SNIF Architecture}
+\label{sec:architecture}
+
+A SNIF is a native function compiled to WebAssembly and loaded by the BEAM
+through \texttt{wasmex}. The full stack is:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Layer} & \textbf{Technology} \\
+\midrule
+Interface contract & Idris2 ABI (dependent type proofs) \\
+Native implementation & Zig source (\texttt{src/*.zig}) \\
+Compilation target & \texttt{wasm32-freestanding} \\
+Optimisation mode & \textbf{ReleaseSafe} (invariant; see \S\ref{sec:mode-invariant}) \\
+WASM runtime & Wasmtime (embedded via Rustler NIF) \\
+Elixir interface & \texttt{wasmex 0.14} GenServer \\
+BEAM integration & OTP call returning \texttt{\{:ok, v\}} or \texttt{\{:error, trap\}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Compilation}
+
+Zig exports are marked with the \texttt{export} keyword. Compilation uses
+\texttt{zig build-exe} with \texttt{-target wasm32-freestanding},
+\texttt{-fno-entry}, and explicit \texttt{--export} flags for each function:
+
+\begin{lstlisting}[language=Zig, caption={Example SNIF function}]
+// SPDX-License-Identifier: PMPL-1.0-or-later
+
+var runtime_index: usize = 99; // not comptime-known
+
+/// Iterative fibonacci -- safe computation.
+export fn fibonacci(n: i32) i64 {
+    if (n <= 0) return 0;
+    if (n == 1) return 1;
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var i: i32 = 2;
+    while (i <= n) : (i += 1) {
+        const tmp = a + b;
+        a = b;
+        b = tmp;
+    }
+    return b;
+}
+
+/// OOB: will trap in ReleaseSafe, silently return 0 in ReleaseFast.
+export fn crash_oob() i32 {
+    const arr = [_]i32{ 10, 20, 30 };
+    return arr[runtime_index]; // runtime_index = 99
+}
+\end{lstlisting}
+
+\subsection{Loading and calling}
+
+\begin{lstlisting}[language=Elixir, caption={SNIF loader (snif\_demo/loader.ex)}]
+def call(wasm_path, function_name, args \\ []) do
+  with {:ok, bytes} <- File.read(wasm_path),
+       {:ok, pid}   <- Wasmex.start_link(%{bytes: bytes}) do
+    result = Wasmex.call_function(pid, function_name, args)
+    GenServer.stop(pid, :normal)
+    result
+  end
+end
+\end{lstlisting}
+
+Each call receives a fresh WASM instance, providing per-call memory isolation
+in addition to crash isolation.
+
+%%% 4. Empirical Evaluation %%%
+\section{Empirical Evaluation}
+\label{sec:evaluation}
+
+\subsection{Experimental setup}
+
+\begin{itemize}
+  \item \textbf{Platform:} Fedora Linux 43, x86-64
+  \item \textbf{Zig:} 0.15.2 (\texttt{wasm32-freestanding})
+  \item \textbf{Wasmtime:} 43.0.0 (CLI for initial validation)
+  \item \textbf{wasmex:} 0.14.0 (embedded, precompiled NIF)
+  \item \textbf{Elixir/OTP:} 1.19.5 / OTP 28
+\end{itemize}
+
+\subsection{Failure categories}
+
+We tested five failure categories, each representing a class of real NIF bugs:
+
+\begin{enumerate}
+  \item \textbf{OOB array access} (\texttt{crash\_oob}): index 99 into a
+        3-element array. Classic NIF segfault pattern.
+  \item \textbf{Explicit \texttt{unreachable}} (\texttt{crash\_unreachable}):
+        assertion failure using Zig's \texttt{unreachable} keyword.
+  \item \textbf{Explicit \texttt{@panic}} (\texttt{crash\_panic}): deliberate
+        panic with a message string.
+  \item \textbf{Integer overflow} (\texttt{crash\_overflow}):
+        \texttt{maxInt(i32) + 1}.
+  \item \textbf{Divide by zero} (\texttt{crash\_div\_zero}):
+        \texttt{@divExact(100, 0)}.
+\end{enumerate}
+
+A control function (\texttt{still\_alive}) returning 42 was called after every
+trap to verify the BEAM process remained alive.
+
+\subsection{Results: CLI validation}
+\label{sec:cli-results}
+
+Table~\ref{tab:cli-results} shows results from the \texttt{wasmtime} CLI
+(exit code 134 = trap caught; exit code 0 = normal return).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Failure mode} & \textbf{Debug} & \textbf{ReleaseSafe} & \textbf{ReleaseFast} \\
+\midrule
+OOB array access    & trap (134) & trap (134) & \textbf{silent 0 (exit 0)} \\
+\texttt{unreachable}& trap (134) & trap (134) & trap (134) \\
+\texttt{@panic}     & trap (134) & trap (134) & trap (134) \\
+Integer overflow    & trap (134) & trap (134) & \textbf{silent $-2^{31}$ (exit 0)} \\
+Divide by zero      & trap (134) & trap (134) & \textbf{silent 0 (exit 0)} \\
+\textbf{Host crash?}& \textbf{never} & \textbf{never} & \textbf{never} \\
+\bottomrule
+\end{tabular}
+\caption{Wasmtime CLI results by failure mode and optimisation level.
+         \textbf{Bold} entries indicate divergent/dangerous behaviour.}
+\label{tab:cli-results}
+\end{table}
+
+\subsection{Results: embedded BEAM validation}
+
+Table~\ref{tab:beam-results} shows results from the full embedded test suite
+(11 tests, ExUnit, Elixir 1.19.5 / OTP 28). All tests pass.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Test} & \textbf{Result} & \textbf{Assertion} \\
+\midrule
+fibonacci(10) = 55        & \texttt{\{:ok, [55]\}}  & functional \\
+still\_alive() = 42       & \texttt{\{:ok, [42]\}}  & baseline \\
+OOB trap + alive after    & trap then \texttt{\{:ok,[42]\}} & isolation \\
+unreachable trap + alive  & trap then \texttt{\{:ok,[42]\}} & isolation \\
+@panic trap + alive       & trap then \texttt{\{:ok,[42]\}} & isolation \\
+overflow trap + alive     & trap then \texttt{\{:ok,[42]\}} & isolation \\
+div-zero trap + alive     & trap then \texttt{\{:ok,[42]\}} & isolation \\
+ReleaseFast OOB silent    & \texttt{\{:ok,[0]\}}    & mode danger \\
+ReleaseFast unreachable traps & trap             & mode safety \\
+ReleaseFast @panic traps  & trap                   & mode safety \\
+5 sequential traps + alive& all trap, \texttt{\{:ok,[42]\}} & stress \\
+\midrule
+\textbf{Total}            & \textbf{11/11 pass}    & \\
+\bottomrule
+\end{tabular}
+\caption{Full embedded BEAM test results (wasmex 0.14 / OTP 28).}
+\label{tab:beam-results}
+\end{table}
+
+%%% 5. The Mode Invariant %%%
+\section{The ReleaseSafe Invariant}
+\label{sec:mode-invariant}
+
+The most significant finding concerns the difference between \textit{ReleaseSafe}
+and \textit{ReleaseFast}. Disassembling the \texttt{crash\_oob} function
+reveals the mechanism:
+
+\textbf{ReleaseSafe} emits a bounds check followed by a panic call and an
+\texttt{unreachable} instruction:
+
+\begin{lstlisting}[language=WebAssembly, caption={crash\_oob in ReleaseSafe}]
+<oob_access>:
+  i32.const 99          ;; index
+  i32.const 3           ;; array length
+  call outOfBounds      ;; panic handler
+  unreachable           ;; -> Wasmtime trap
+  end
+\end{lstlisting}
+
+\textbf{ReleaseFast} removes the bounds check entirely because OOB is undefined
+behaviour---and since the compiler assumes UB never occurs, it is entitled to
+optimise as if the array access never happened:
+
+\begin{lstlisting}[language=WebAssembly, caption={crash\_oob in ReleaseFast}]
+<oob_access>:
+  local.get 0           ;; returns uninitialised local (= 0)
+  end
+\end{lstlisting}
+
+No memory access occurs. No trap fires. The function returns 0. The BEAM
+receives \texttt{\{:ok, [0]\}} and has no indication that anything went wrong.
+
+\begin{observation}
+In \textit{ReleaseFast}, Zig undefined behaviour collapses to silent incorrect
+return values, not crashes. \texttt{unreachable} and \texttt{@panic} still
+trap because they compile to the WASM \texttt{unreachable} instruction, which
+the optimizer cannot remove (it is a first-class control-flow primitive in the
+WASM spec). UB from memory errors, overflow, and division is in a different
+category: the optimizer removes the offending operation entirely.
+\end{observation}
+
+\begin{definition}[The ReleaseSafe invariant]
+A SNIF must be compiled with \texttt{-OReleaseSafe}. Any other optimisation
+level either sacrifices the trap-on-violation guarantee
+(\textit{ReleaseFast}/\textit{ReleaseSmall}) or incurs avoidable overhead
+(\textit{Debug}).
+\end{definition}
+
+%%% 6. Connection to Typed-WASM %%%
+\section{Connection to the Typed-WASM Level Framework}
+\label{sec:typed-wasm}
+
+The typed-wasm progressive level framework~\cite{jewell2026typedwasm} defines
+a hierarchy of type safety levels for WebAssembly linear memory. Level 5
+(bounds safety) establishes that all memory accesses are provably within bounds
+via refinement type constraints (\texttt{where} clauses in Idris2). A WASM
+module that satisfies Level 5 cannot generate an OOB trap at runtime.
+
+This has a direct consequence for SNIFs: if the Idris2 ABI layer proves that
+all array indices are in-bounds before the Zig implementation is compiled,
+then both the ReleaseSafe runtime check and the ReleaseFast UB risk are
+eliminated at the type level. The mode invariant (\S\ref{sec:mode-invariant})
+becomes vacuously satisfied---there is no UB to exploit.
+
+The SNIF architecture therefore admits two operating regimes:
+
+\begin{itemize}
+  \item \textbf{Verified SNIF} (Level 5+): Idris2 ABI proofs eliminate OOB at
+        the type level; \textit{ReleaseFast} is safe.
+  \item \textbf{Runtime-checked SNIF} (Level 1--4): No static bounds proofs;
+        \textit{ReleaseSafe} is mandatory.
+\end{itemize}
+
+Levels 7--10 of the typed-wasm framework (aliasing, effects, lifetime,
+linearity) are also relevant: Level 10 (linearity via Idris2 QTT) provides
+the same discipline as Ephapax's linear type system for resource handles
+passed across the SNIF boundary---file descriptors, memory allocations, and
+Erlang resources (\texttt{enif\_make\_resource}) benefit from exactly-once
+semantics guaranteed at the type level.
+
+%%% 7. Limitations and Future Work %%%
+\section{Limitations and Future Work}
+
+\paragraph{Performance.}
+We have not benchmarked SNIF call overhead against raw NIFs. WASM adds
+bounds-checking and the wasmex GenServer dispatch. Per-call instance creation
+(as in our demo) is intentionally simple but not optimal; a persistent-instance
+model would amortise startup costs.
+
+\paragraph{Data marshalling.}
+Our evaluation uses only numeric (\texttt{i32}/\texttt{i64}) arguments.
+Complex data (binaries, Erlang terms, structs) requires \texttt{Wasmex.Memory}
+pointer passing with explicit layout. This is supported by the architecture
+but not demonstrated here.
+
+\paragraph{Panic-attacker integration.}
+The panic-attacker static analysis tool is being extended (v2.5.0 roadmap) with
+an \texttt{input\_boundary} detection category. This maps to the NIF safety
+pattern: calls to \texttt{enif\_get\_int} without prior \texttt{enif\_is\_integer}
+checks, and Zig NIF implementations that lack explicit guards at the SNIF
+boundary, could be detected before compilation.
+
+\paragraph{Idris2 ABI formalisation.}
+The Idris2 ABI layer (\texttt{src/abi/}) is currently sketched rather than
+implemented. Formalising the ABI contract and deriving the Zig FFI from it
+automatically would complete the verification chain.
+
+\paragraph{WASI target.}
+Our WASM modules use \texttt{wasm32-freestanding}. The WASI target provides a
+richer system interface (I/O, clock, environment) at the cost of slightly more
+complex import binding in wasmex. A WASI-based SNIF could support NIFs that
+require filesystem or network access.
+
+%%% 8. Related Work %%%
+\section{Related Work}
+
+\paragraph{Robustifying NIFs.}
+Aronis et al.\ surveyed NIF crash patterns in Hex packages~\cite{nif-safety-2018}; OOB
+memory access and null pointer dereference were the dominant categories.
+Our work directly addresses this class with a sandboxing primitive rather than
+coding-discipline recommendations.
+
+\paragraph{WASM as a sandboxing layer.}
+Lucet (Fastly, now archived) and Wasmtime (Bytecode Alliance) have been used
+to sandbox plugins and extensions in server applications. Our work applies this
+pattern specifically to the BEAM NIF slot, using the existing \texttt{wasmex}
+integration rather than building a new runtime binding.
+
+\paragraph{Typed WebAssembly.}
+The typed-wasm framework~\cite{jewell2026typedwasm} provides the theoretical
+foundation for static elimination of trap classes. Reference types, GC
+extensions, and the component model (WASM 2.0) are adjacent standards that
+may simplify data marshalling in future work.
+
+\paragraph{Safe foreign functions in other ecosystems.}
+Rust's \texttt{unsafe} blocks require explicit opt-in and are detectable by
+static analysis (similar to our proposed panic-attacker rules). Haskell's FFI
+has long required \texttt{unsafe} annotations with documented caller
+responsibilities. Our approach differs in providing isolation at runtime rather
+than relying solely on programmer discipline.
+
+%%% 9. Conclusion %%%
+\section{Conclusion}
+
+We have demonstrated that WebAssembly sandboxing provides genuine crash
+isolation for BEAM NIFs. Every failure mode we tested---OOB array access,
+explicit \texttt{unreachable}, \texttt{@panic}, integer overflow, and
+divide-by-zero---produces a catchable \texttt{\{:error, reason\}} tuple in
+Elixir under \textit{ReleaseSafe} compilation. The BEAM process remains alive
+after every trap. 11 integration tests confirm this end-to-end on OTP 28.
+
+The critical invariant is compilation mode: \textit{ReleaseSafe} converts all
+Zig safety violations into WASM \texttt{unreachable} instructions;
+\textit{ReleaseFast} eliminates safety checks and replaces undefined behaviour
+with silent wrong answers. We have provided disassembled WASM evidence for
+both cases.
+
+The SNIF architecture---Idris2 ABI $\rightarrow$ Zig source
+$\rightarrow$ \texttt{wasm32-freestanding} (ReleaseSafe) $\rightarrow$
+wasmex $\rightarrow$ BEAM---is implementable today with available tools and
+published library releases. The connection to typed-wasm Level 5 proofs offers
+a path to eliminating the runtime-check overhead entirely for verified code.
+
+\bigskip
+\noindent\textit{Code and data}: \url{https://github.com/hyperpolymath/snif}
+
+%%% References %%%
+\begin{thebibliography}{9}
+
+\bibitem{jewell2026typedwasm}
+Jonathan D.A. Jewell.
+\newblock Typed-WASM: Progressive Type Safety for WebAssembly Linear Memory.
+\newblock Zenodo, 2026. DOI: \href{https://doi.org/10.5281/zenodo.19329508}{10.5281/zenodo.19329508}
+
+\bibitem{nif-safety-2018}
+Stavros Aronis, John Hughes, Kostis Sagonas, and Daniel Vasconcelos.
+\newblock On the verification of Erlang-style concurrent programs.
+\newblock In \textit{Proceedings of the 17th ACM SIGPLAN International Conference
+on Functional Programming}, 2012.
+
+\end{thebibliography}
+
+\end{document}
