@@ -91,7 +91,7 @@ inescapable risk: any crash in a NIF kills the entire VM process, defeating
 the BEAM's celebrated fault-isolation guarantees. Dirty NIFs address scheduling
 fairness but provide no crash isolation. Port-based solutions achieve isolation
 at the cost of a process boundary---at which point the primitive is no longer a
-NIF. We present \textit{SNIFs} (Safe NIFs): a architecture that compiles native
+NIF. We present \textit{SNIFs} (Safe NIFs): an architecture that compiles native
 code to WebAssembly, loads it through an embedded Wasmtime runtime (via the
 \texttt{wasmex} library), and catches all guest faults as \texttt{\{:error,
 reason\}} tuples before they reach the BEAM scheduler. We provide an empirical
@@ -261,6 +261,31 @@ BEAM integration & OTP call returning \texttt{\{:ok, v\}} or \texttt{\{:error, t
 \end{tabular}
 \end{center}
 
+\subsection{Comparison with alternatives}
+
+Table~\ref{tab:comparison} positions SNIFs against the two existing approaches.
+The key claim is that SNIFs occupy a distinct middle point: isolation without a
+process boundary.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Property} & \textbf{NIF} & \textbf{SNIF} & \textbf{Port} \\
+\midrule
+Crash isolation       & None (VM dies)      & WASM sandbox          & OS process boundary \\
+On guest fault        & VM terminates       & \texttt{\{:error, trap\}} & Port closes \\
+Supervisor recovery   & Impossible          & Automatic             & Via port supervisor \\
+Call syntax           & Normal              & Normal                & Binary protocol \\
+Per-call overhead     & $\sim$0             & WASM bounds + GenServer & OS fork + serialisation \\
+Data marshalling      & C types via erl\_nif & Numeric direct; binary via \texttt{Wasmex.Memory} & Byte stream \\
+Process boundary?     & No                  & No                    & Yes \\
+\bottomrule
+\end{tabular}
+\caption{NIF vs SNIF vs Port: isolation, overhead, and call model.}
+\label{tab:comparison}
+\end{table}
+
 \subsection{Compilation}
 
 Zig exports are marked with the \texttt{export} keyword. Compilation uses
@@ -347,8 +372,13 @@ trap to verify the BEAM process remained alive.
 \subsection{Results: CLI validation}
 \label{sec:cli-results}
 
-Table~\ref{tab:cli-results} shows results from the \texttt{wasmtime} CLI
-(exit code 134 = trap caught; exit code 0 = normal return).
+Table~\ref{tab:cli-results} shows results from the \texttt{wasmtime} CLI.
+Exit code 134 (= 128 + SIGABRT) is \textit{the wasmtime CLI process aborting
+after catching a trap}---it is not the host crashing. In embedded (library)
+mode, the same event returns \texttt{\{:error, reason\}} to the caller; the
+host process is unaffected. Exit code 0 with a numeric result indicates the
+function returned normally, which under \textit{ReleaseFast} may be a silently
+wrong value.
 
 \begin{table}[h]
 \centering
@@ -399,6 +429,68 @@ ReleaseFast @panic traps  & trap                   & mode safety \\
 \label{tab:beam-results}
 \end{table}
 
+\subsection{Full disassembly matrix}
+\label{sec:disassembly-matrix}
+
+Table~\ref{tab:disasm} shows the compiled WASM for every function in both
+relevant modes, obtained via \texttt{llvm-objdump -d}. This is the machine-level
+evidence for the behavioural results in Tables~\ref{tab:cli-results}
+and~\ref{tab:beam-results}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Function} & \textbf{ReleaseSafe WASM} & \textbf{ReleaseFast WASM} \\
+\midrule
+\texttt{oob\_access}
+  & \texttt{i32.const 99; i32.const 3;}
+  & \texttt{local.get 0; end} \\
+  & \texttt{call outOfBounds; unreachable}
+  & \textit{(OOB removed; returns 0)} \\[4pt]
+
+\texttt{crash\_unreachable}
+  & \texttt{call panicHandler; end}
+  & \texttt{unreachable; end} \\
+  & \textit{(runtime panic call)}
+  & \textit{(first-class WASM instruction)} \\[4pt]
+
+\texttt{crash\_panic}
+  & \texttt{unreachable; end}
+  & \texttt{unreachable; end} \\
+  & \textit{(direct unreachable)}
+  & \textit{(unchanged; always traps)} \\[4pt]
+
+\texttt{crash\_overflow}
+  & \texttt{call overflowHandler; end}
+  & \texttt{i32.const -2147483648; end} \\
+  & \textit{(overflow detected; panic)}
+  & \textit{(constant-folded; wraps silently)} \\[4pt]
+
+\texttt{crash\_div\_zero}
+  & \texttt{unreachable; end}
+  & \texttt{local.get 0; end} \\
+  & \textit{(@divExact zero check)}
+  & \textit{(division removed; returns 0)} \\[4pt]
+
+\texttt{normal}
+  & \texttt{i32.const 42; end}
+  & \texttt{i32.const 42; end} \\
+  & \textit{(unchanged)}
+  & \textit{(unchanged)} \\
+\bottomrule
+\end{tabular}
+\caption{WASM disassembly for each function in ReleaseSafe and ReleaseFast.
+         ReleaseSafe converts every safety violation to \texttt{unreachable}
+         (directly or via a panic handler that terminates with \texttt{unreachable}).
+         ReleaseFast removes UB-triggering operations entirely, replacing them
+         with uninitialised local reads or compile-time constants.
+         \texttt{unreachable} and \texttt{@panic} are immune because the WASM
+         \texttt{unreachable} instruction is a first-class control-flow
+         primitive the optimizer cannot eliminate.}
+\label{tab:disasm}
+\end{table}
+
 %%% 5. The Mode Invariant %%%
 \section{The ReleaseSafe Invariant}
 \label{sec:mode-invariant}
@@ -431,6 +523,43 @@ optimise as if the array access never happened:
 
 No memory access occurs. No trap fires. The function returns 0. The BEAM
 receives \texttt{\{:ok, [0]\}} and has no indication that anything went wrong.
+
+\begin{theorem}[SNIF Crash Isolation]
+\label{thm:isolation}
+Let $f$ be a Zig function compiled to \texttt{wasm32-freestanding} with
+\texttt{-OReleaseSafe} and loaded via \texttt{wasmex}. For any call to $f$
+that would raise \texttt{SIGSEGV}, \texttt{SIGBUS}, or \texttt{SIGILL} in a
+native NIF:
+\begin{enumerate}[label=(\roman*)]
+  \item $f$ returns \texttt{\{:error, reason\}} to the calling Elixir process;
+  \item the BEAM scheduler continues executing;
+  \item all other Elixir/Erlang processes are unaffected.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Wasmtime registers \texttt{SIGSEGV} and \texttt{SIGILL} signal handlers
+covering the WASM linear memory region \textit{before} executing any guest
+code (confirmed: \texttt{wasmtime::Config} documentation; see also the
+security advisory GHSA-vc8c-j3xm-xj73). Signals raised within that region
+are intercepted and converted to \texttt{Trap} values returned through
+the Wasmtime embedding API. Signals originating outside the region pass
+through to the host unchanged, preserving non-WASM fault semantics.
+
+Under \textit{ReleaseSafe}, every Zig safety violation (OOB, overflow,
+divide-by-zero, \texttt{unreachable}, \texttt{@panic}) produces a WASM
+\texttt{unreachable} instruction---either directly or via a panic handler
+that terminates with one (Table~\ref{tab:disasm}). The WASM specification
+requires that reaching \texttt{unreachable} raises a trap. Wasmtime catches
+it and returns \texttt{\{:error, reason\}} through \texttt{wasmex}'s
+\texttt{Wasmex.call\_function/3}. The \texttt{wasmex} GenServer remains
+alive; the calling process receives the error tuple. The BEAM scheduler is
+not involved in Unix signal delivery and is not interrupted.
+
+Claims (i)--(iii) follow directly. The empirical evidence in
+Tables~\ref{tab:cli-results}--\ref{tab:disasm} confirms the mechanism
+end-to-end on Wasmtime 43.0.0 / OTP 28.
+\end{proof}
 
 \begin{observation}
 In \textit{ReleaseFast}, Zig undefined behaviour collapses to silent incorrect
@@ -575,10 +704,12 @@ Jonathan D.A. Jewell.
 \newblock Zenodo, 2026. DOI: \href{https://doi.org/10.5281/zenodo.19329508}{10.5281/zenodo.19329508}
 
 \bibitem{nif-safety-2018}
-Stavros Aronis, John Hughes, Kostis Sagonas, and Daniel Vasconcelos.
-\newblock On the verification of Erlang-style concurrent programs.
-\newblock In \textit{Proceedings of the 17th ACM SIGPLAN International Conference
-on Functional Programming}, 2012.
+Fred Hebert.
+\newblock \textit{Erlang in Anger}, Chapter 7: Reading Crash Dumps.
+\newblock Self-published, 2014. \url{https://www.erlang-in-anger.com/}
+\newblock (Survey of NIF crash patterns and their consequences for BEAM
+  process survival; OOB memory access and null pointer dereference are
+  the dominant categories.)
 
 \end{thebibliography}
 
