@@ -12,6 +12,11 @@ pub fn build(b: *std.Build) void {
         "crash_panic", "crash_overflow", "crash_div_zero", "still_alive",
     };
 
+    const fft_exports = [_][]const u8{
+        "fft", "ifft", "crash_oob_fft", "still_alive", "test_constant",
+    };
+
+    // Build original SNIF demos
     inline for (modes) |mode| {
         const name = "safe_nif_" ++ mode[0];
         const exe = b.addExecutable(.{
@@ -28,4 +33,19 @@ pub fn build(b: *std.Build) void {
         _ = exports;
         b.installArtifact(exe);
     }
+
+    // Build Burble FFT SNIF
+    const burble_fft = b.addExecutable(.{
+        .name = "burble_fft",
+        .root_source_file = b.path("src/burble_fft.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .wasm32,
+            .os_tag = .freestanding,
+        }),
+        .optimize = .ReleaseSafe,
+    });
+    burble_fft.entry = .disabled;
+    for (fft_exports) |exp| burble_fft.rdynamic = true;
+    _ = fft_exports;
+    b.installArtifact(burble_fft);
 }
