@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: PMPL-1.0-or-later
 = SNIFs: Safe Native Implemented Functions for the BEAM via WebAssembly Sandboxing
+
+This repository contains:
+(1) the SNIF architecture paper,
+(2) a working BEAM + WASM implementation,
+(3) integration tests and benchmarking,
+(4) formal verification artifacts.
 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
 :toc:
 :source-highlighter: highlight.js
@@ -16,6 +22,9 @@ and loading it through `wasmex` converts all guest faults into
 `{:error, reason}` tuples — the BEAM process survives unconditionally.
 
 == Key result
+
+Formal verification:
+7/7 core proofs completed (Idris2 + Lean4), covering ABI correctness and API type safety.
 
 11/11 integration tests pass on OTP 28 / Elixir 1.19.5. Every failure mode
 (OOB array access, `unreachable`, `@panic`, integer overflow, divide-by-zero)
@@ -63,3 +72,19 @@ Requires Zig 0.15+.
 == License
 
 PMPL-1.0-or-later. See `LICENSE`.
+
+
+== Citation
+
+If you use this work, please cite:
+
+[source,bibtex]
+----
+@misc{jewell2026snifs,
+  author = {Jewell, Jonathan D. A.},
+  title = {SNIFs: Safe Native Implemented Functions for the BEAM via WebAssembly Sandboxing},
+  year = {2026},
+  doi = {10.5281/zenodo.19520245},
+  publisher = {Zenodo}
+}
+----
